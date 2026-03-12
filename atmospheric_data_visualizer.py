@@ -1,72 +1,110 @@
-import streamlit as st
+"""
+anomaly_detector.py
+Anomaly detection using Isolation Forest with StandardScaler preprocessing.
+"""
+
 import pandas as pd
 import numpy as np
-import plotly.express as px
-import requests
 from sklearn.ensemble import IsolationForest
-from datetime import datetime
+from sklearn.preprocessing import StandardScaler
+import joblib
+import os
 
-st.set_page_config(page_title="Atmospheric Data visualizer And Anomaly Detector", layout="wide")
+MODEL_DIR = "models"
+MODEL_PATH = os.path.join(MODEL_DIR, "isolation_forest.pkl")
+SCALER_PATH = os.path.join(MODEL_DIR, "scaler.pkl")
 
-st.title("🌍 Atmospheric Data Visualizer & Anomaly Detector")
-st.markdown("Live tracking and anomaly detection for temperature, pressure, and humidity.")
+FEATURE_COLS = [
+    "temperature_2m",
+    "relativehumidity_2m",
+    "pressure_msl",
+    "windspeed_10m",
+    "pm2_5",
+    "pm10",
+]
 
-st.sidebar.header("Location Settings")
-city = st.sidebar.text_input("Enter City Name", "hyderabad")
 
-def get_coords(city_name):
-    try:
-        url = f"https://geocoding-api.open-meteo.com/v1/search?name={city_name}&count=1&language=en&format=json"
-        res = requests.get(url).json()
-        if 'results' in res:
-            return res['results'][0]['latitude'], res['results'][0]['longitude']
-        return None, None
-    except:
-        return None, None
+def prepare_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Select and fill feature columns for anomaly detection."""
+    avail = [c for c in FEATURE_COLS if c in df.columns]
+    X = df[avail].copy()
+    X = X.fillna(X.median())
+    return X
 
-lat, lon = get_coords(city)
 
-if lat and lon:
-    st.sidebar.success(f"Coordinates: {lat}, {lon}")
-    
-    @st.cache_data(ttl=3600)  
-    def fetch_weather_data(lat, lon):
-        url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&hourly=temperature_2m,relative_humidity_2m,surface_pressure&past_days=7"
-        response = requests.get(url).json()
-        df = pd.DataFrame(response['hourly'])
-        df['time'] = pd.to_datetime(df['time'])
+def detect_anomalies(df: pd.DataFrame, contamination: float = 0.05) -> pd.DataFrame:
+    """
+    Detect anomalies using Isolation Forest.
+    Adds columns: 'anomaly' (-1 = anomaly, 1 = normal), 'anomaly_score'
+    """
+    df = df.copy()
+    X = prepare_features(df)
+
+    if len(X) < 10:
+        df["anomaly"] = 1
+        df["anomaly_score"] = 0.0
         return df
 
-    data = fetch_weather_data(lat, lon)
+    # Scale features
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
 
-    st.subheader("🔍 Anomaly Detection Analysis")
-    contamination = st.slider("Anomaly Sensitivity (Contamination)", 0.01, 0.10, 0.05)
-    
-    model = IsolationForest(contamination=contamination, random_state=42)
-    features = data[['temperature_2m', 'surface_pressure']]
-    data['anomaly_score'] = model.fit_predict(features)
-    
-    data['is_anomaly'] = data['anomaly_score'].apply(lambda x: 'Anomaly' if x == -1 else 'Normal')
+    # Train / apply Isolation Forest
+    iso_forest = IsolationForest(
+        contamination=contamination,
+        n_estimators=200,
+        max_samples="auto",
+        random_state=42,
+        n_jobs=-1,
+    )
+    predictions = iso_forest.fit_predict(X_scaled)
+    scores = iso_forest.decision_function(X_scaled)  # higher = more normal
 
-    col1, col2 = st.columns(2)
+    df["anomaly"] = predictions          # -1 = anomaly, 1 = normal
+    df["anomaly_score"] = scores
 
-    with col1:
-        st.write("### Temperature Trend")
-        fig_temp = px.line(data, x='time', y='temperature_2m', title=f"Temperature in {city}")
-        anomalies = data[data['is_anomaly'] == 'Anomaly']
-        fig_temp.add_scatter(x=anomalies['time'], y=anomalies['temperature_2m'], 
-                             mode='markers', name='Anomaly', marker=dict(color='red', size=8))
-        st.plotly_chart(fig_temp, use_container_width=True)
+    # Save models for reuse
+    os.makedirs(MODEL_DIR, exist_ok=True)
+    joblib.dump(iso_forest, MODEL_PATH)
+    joblib.dump(scaler, SCALER_PATH)
 
-    with col2:
-        st.write("### Pressure vs Humidity")
-        fig_scatter = px.scatter(data, x='surface_pressure', y='relative_humidity_2m', 
-                                 color='is_anomaly', title="Anomaly Clustering",
-                                 color_discrete_map={'Normal': 'blue', 'Anomaly': 'red'})
-        st.plotly_chart(fig_scatter, use_container_width=True)
+    n_anomalies = int((predictions == -1).sum())
+    print(f"Anomaly detection complete: {n_anomalies}/{len(df)} anomalies detected ({n_anomalies/len(df)*100:.1f}%)")
 
-    with st.expander("View Raw Atmospheric Data"):
-        st.write(data)
+    return df
 
-else:
-    st.error("City not found. Please check the spelling.")
+
+def load_and_predict(df: pd.DataFrame) -> pd.DataFrame:
+    """Load saved model and predict on new data (if model exists)."""
+    if not os.path.exists(MODEL_PATH) or not os.path.exists(SCALER_PATH):
+        return detect_anomalies(df)
+
+    df = df.copy()
+    X = prepare_features(df)
+    scaler = joblib.load(SCALER_PATH)
+    iso_forest = joblib.load(MODEL_PATH)
+
+    X_scaled = scaler.transform(X)
+    df["anomaly"] = iso_forest.predict(X_scaled)
+    df["anomaly_score"] = iso_forest.decision_function(X_scaled)
+    return df
+
+
+def get_anomaly_summary(df: pd.DataFrame) -> dict:
+    """Return a summary dict of anomaly statistics."""
+    if "anomaly" not in df.columns:
+        return {}
+
+    total = len(df)
+    n_anomalies = int((df["anomaly"] == -1).sum())
+    pct = round(n_anomalies / total * 100, 2) if total > 0 else 0
+
+    anomaly_df = df[df["anomaly"] == -1]
+    summary = {
+        "total_records": total,
+        "anomaly_count": n_anomalies,
+        "anomaly_percentage": pct,
+        "avg_anomaly_temp": round(anomaly_df["temperature_2m"].mean(), 2) if not anomaly_df.empty else None,
+        "avg_anomaly_pm25": round(anomaly_df["pm2_5"].mean(), 2) if not anomaly_df.empty and "pm2_5" in anomaly_df.columns else None,
+    }
+    return summary
